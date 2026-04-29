@@ -1,180 +1,397 @@
-from __future__ import annotations
-
-import asyncio
-import random
-import threading
 import time
-from dataclasses import dataclass
-from typing import Literal, Optional
+import urllib.request
+from collections import deque
+from pathlib import Path
+from threading import Lock, Thread
+from typing import Literal
 
-from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+import cv2
+import mediapipe as mp
+import numpy as np
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-
-# ----------------------------
-# Robot state (in-memory)
-# ----------------------------
-
-Mode = Literal["AUTO", "OVERRIDE"]
-RobotStatus = Literal["moving", "stopped"]
-Command = Literal["STOP", "RESUME", "LEFT", "RIGHT"]
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python import vision
+from mediapipe.python.solutions.hands_connections import HAND_CONNECTIONS
+from pydantic import BaseModel
 
 
-@dataclass
-class RobotState:
-    mode: Mode = "AUTO"
-    gesture: str = "palm"
-    confidence: float = 0.93
-    command: Command = "STOP"
-    robot_status: RobotStatus = "stopped"
-    last_updated_ts: float = time.time()
-    last_manual_ts: Optional[float] = None
+# 실행 방법:
+# 1) backend 폴더로 이동
+# 2) uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+ModeType = Literal["AUTO", "OVERRIDE"]
+CommandType = Literal["NONE", "STOP", "RESUME", "LEFT", "RIGHT"]
+SourceType = Literal["gesture", "web"]
 
 
-robot_state = RobotState()
-state_lock = threading.Lock()
+class StatusState(BaseModel):
+    mode: ModeType = "AUTO"
+    gesture: str = "unknown"
+    stable_gesture: str = "unknown"
+    command: CommandType = "NONE"
+    robot_status: str = "Moving"
+    source: SourceType = "gesture"
 
 
-ALLOWED_COMMANDS: set[str] = {"STOP", "RESUME", "LEFT", "RIGHT"}
-ALLOWED_MODES: set[str] = {"AUTO", "OVERRIDE"}
-GESTURE_TO_COMMAND: dict[str, Command] = {
-    # Example mapping: gestures -> robot commands
-    "palm": "STOP",
-    "thumb": "RESUME",
-    "left": "LEFT",
-    "right": "RIGHT",
-}
-GESTURES: list[str] = ["palm", "thumb", "left", "right"]
+class StatusUpdateRequest(BaseModel):
+    mode: ModeType
+    gesture: str
+    stable_gesture: str
+    command: CommandType
+    robot_status: str
+    source: SourceType = "gesture"
 
 
-def _set_state(**kwargs) -> None:
-    """Thread-safe update for the in-memory state."""
-    with state_lock:
-        for k, v in kwargs.items():
-            setattr(robot_state, k, v)
-        robot_state.last_updated_ts = time.time()
+class CommandRequest(BaseModel):
+    command: Literal["STOP", "RESUME", "LEFT", "RIGHT"]
 
 
-def _compute_robot_status_from_command(command: Command) -> RobotStatus:
-    if command == "STOP":
-        return "stopped"
-    return "moving"
+app = FastAPI(title="Hand Gesture Robot Backend")
+BACKEND_DIR = Path(__file__).resolve().parent
+FRONTEND_DIR = BACKEND_DIR.parent / "frontend"
+
+# 프론트엔드(localhost 포함)에서 API 호출 가능하도록 CORS 허용
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+state_lock = Lock()
+current_status = StatusState()
+camera_lock = Lock()
+camera_capture = None
+frame_lock = Lock()
+latest_frame_jpg: bytes | None = None
+camera_worker_running = False
+camera_worker_thread: Thread | None = None
+landmark_enabled = False
+show_overlay = True
 
 
-def _build_status_payload() -> dict:
-    # Must match the UI requirement field names.
-    with state_lock:
-        return {
-            "mode": robot_state.mode,
-            "gesture": robot_state.gesture,
-            "confidence": robot_state.confidence,
-            "command": robot_state.command,
-            "robot_status": robot_state.robot_status,
-        }
-
-
-# ----------------------------
-# Background "gesture recognition"
-# ----------------------------
-
-async def gesture_recognition_loop() -> None:
-    """
-    In a real system, replace this loop with actual gesture recognition results.
-    This is a functional placeholder so the UI works end-to-end.
-    """
-    while True:
-        await asyncio.sleep(1.0)
-
-        # OVERRIDE는 잠깐 유지 후 AUTO로 복귀합니다(데모/UX 목적).
-        with state_lock:
-            if robot_state.mode != "AUTO":
-                if robot_state.last_manual_ts is not None:
-                    manual_age = time.time() - robot_state.last_manual_ts
-                    if manual_age >= 5.0:
-                        robot_state.mode = "AUTO"
-                        robot_state.last_manual_ts = None
-                if robot_state.mode != "AUTO":
-                    # While OVERRIDE: keep command/robot status as set by the operator.
-                    continue
-
-        gesture = random.choice(GESTURES)
-        confidence = round(random.uniform(0.75, 0.99), 2)
-        command = GESTURE_TO_COMMAND[gesture]
-        robot_status = _compute_robot_status_from_command(command)
-        _set_state(
-            gesture=gesture,
-            confidence=confidence,
-            command=command,
-            robot_status=robot_status,
+def ensure_hand_landmarker_model() -> Path:
+    model_dir = Path("C:/mp_models")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / "hand_landmarker.task"
+    if not model_path.exists():
+        model_url = (
+            "https://storage.googleapis.com/mediapipe-models/"
+            "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
         )
+        urllib.request.urlretrieve(model_url, str(model_path))
+    return model_path
 
 
-# ----------------------------
-# FastAPI app
-# ----------------------------
+def detect_raw_gesture(hand_landmarks) -> str:
+    tip_pip_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
+    extended_count = sum(1 for tip, pip in tip_pip_pairs if hand_landmarks[tip].y < hand_landmarks[pip].y)
+    if extended_count >= 4:
+        return "palm"
+    if extended_count <= 1:
+        return "fist"
+    return "unknown"
 
-app = FastAPI(title="Gesture Robot Control UI")
+
+def gesture_to_command(stable_gesture: str) -> CommandType:
+    if stable_gesture == "palm":
+        return "STOP"
+    if stable_gesture == "fist":
+        return "RESUME"
+    return "NONE"
+
+
+def draw_hand_landmarks(frame, hand_landmarks) -> None:
+    h, w = frame.shape[:2]
+    points = []
+    for lm in hand_landmarks:
+        px = int(lm.x * w)
+        py = int(lm.y * h)
+        points.append((px, py))
+        cv2.circle(frame, (px, py), 3, (0, 255, 255), -1, cv2.LINE_AA)
+
+    for start_idx, end_idx in HAND_CONNECTIONS:
+        if start_idx < len(points) and end_idx < len(points):
+            cv2.line(frame, points[start_idx], points[end_idx], (255, 0, 0), 2, cv2.LINE_AA)
+
+
+def get_camera_capture():
+    global camera_capture
+    with camera_lock:
+        if camera_capture is None or not camera_capture.isOpened():
+            camera_capture = cv2.VideoCapture(0)
+            if camera_capture.isOpened():
+                camera_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                camera_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        return camera_capture
+
+
+def make_placeholder_frame(message: str, robot_status: str = "Stopped") -> bytes:
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.putText(frame, "Gesture Backend Stream", (28, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (120, 220, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, message, (28, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        f"Robot: {robot_status}",
+        (28, 430),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (200, 200, 200),
+        2,
+        cv2.LINE_AA,
+    )
+    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not ok:
+        return b""
+    return encoded.tobytes()
+
+
+def camera_worker_loop() -> None:
+    global latest_frame_jpg, current_status
+    model_path = ensure_hand_landmarker_model()
+    options = vision.HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(model_path)),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.7,
+        min_tracking_confidence=0.7,
+        min_hand_presence_confidence=0.7,
+    )
+    history: deque[str] = deque(maxlen=10)
+    last_candidate = "unknown"
+    candidate_start = time.monotonic()
+
+    with vision.HandLandmarker.create_from_options(options) as detector:
+        while camera_worker_running:
+            cap = get_camera_capture()
+            if cap is None or not cap.isOpened():
+                with state_lock:
+                    robot_status = current_status.robot_status
+                jpg = make_placeholder_frame("Camera Not Available", robot_status)
+                with frame_lock:
+                    latest_frame_jpg = jpg
+                time.sleep(0.2)
+                continue
+
+            ok, frame = cap.read()
+            if not ok:
+                with state_lock:
+                    robot_status = current_status.robot_status
+                jpg = make_placeholder_frame("Frame Read Failed", robot_status)
+                with frame_lock:
+                    latest_frame_jpg = jpg
+                time.sleep(0.1)
+                continue
+
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int(time.monotonic() * 1000)
+            result = detector.detect_for_video(mp_image, timestamp_ms)
+
+            if result.hand_landmarks:
+                gesture = detect_raw_gesture(result.hand_landmarks[0])
+                # 랜드마크 토글이 켜진 경우에만 오버레이를 그린다.
+                if landmark_enabled:
+                    draw_hand_landmarks(frame, result.hand_landmarks[0])
+            else:
+                gesture = "unknown"
+
+            history.append(gesture)
+            if len(history) < 10:
+                stable_candidate = "unknown"
+                dominant_count = 0
+            else:
+                count_map = {
+                    "palm": list(history).count("palm"),
+                    "fist": list(history).count("fist"),
+                    "unknown": list(history).count("unknown"),
+                }
+                stable_candidate = max(count_map, key=count_map.get)
+                dominant_count = count_map[stable_candidate]
+                if dominant_count < 8:
+                    stable_candidate = "unknown"
+
+            now = time.monotonic()
+            if stable_candidate != last_candidate:
+                last_candidate = stable_candidate
+                candidate_start = now
+            hold_seconds = now - candidate_start
+            stable_gesture = stable_candidate if (stable_candidate != "unknown" and hold_seconds >= 0.5) else "unknown"
+
+            auto_command = gesture_to_command(stable_gesture)
+            auto_robot_status = "Stopped" if auto_command == "STOP" else "Moving"
+
+            with state_lock:
+                status = current_status
+                mode_is_web_override = status.mode == "OVERRIDE" and status.source == "web"
+                if mode_is_web_override:
+                    current_status = status.model_copy(
+                        update={
+                            "gesture": gesture,
+                            "stable_gesture": stable_gesture,
+                        }
+                    )
+                else:
+                    current_status = status.model_copy(
+                        update={
+                            "mode": "AUTO",
+                            "gesture": gesture,
+                            "stable_gesture": stable_gesture,
+                            "command": auto_command,
+                            "robot_status": auto_robot_status,
+                            "source": "gesture",
+                        }
+                    )
+
+            with state_lock:
+                mode_text = current_status.mode
+                command_text = current_status.command
+
+            # 스트리밍 프레임 좌측 상단에 현재 제어 상태 오버레이를 표시한다.
+            if show_overlay:
+                mode_color = (0, 0, 255) if mode_text == "OVERRIDE" else (0, 255, 0)
+                command_color = (255, 255, 255)
+                if command_text == "STOP":
+                    command_color = (0, 0, 255)
+                elif command_text == "RESUME":
+                    command_color = (0, 255, 0)
+
+                cv2.putText(
+                    frame,
+                    f"Mode: {mode_text}",
+                    (10, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    mode_color,
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    frame,
+                    f"Command: {command_text}",
+                    (10, 88),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    command_color,
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if ok:
+                with frame_lock:
+                    latest_frame_jpg = encoded.tobytes()
+
+
+def mjpeg_frame_generator():
+    while True:
+        with frame_lock:
+            jpg = latest_frame_jpg
+        if not jpg:
+            with state_lock:
+                robot_status = current_status.robot_status
+            jpg = make_placeholder_frame("Waiting for camera...", robot_status)
+        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+        time.sleep(0.03)
+
+
+@app.get("/status", response_model=StatusState)
+def get_status() -> StatusState:
+    with state_lock:
+        return current_status.model_copy(deep=True)
+
+
+class LandmarkToggleRequest(BaseModel):
+    enabled: bool
+
+
+@app.get("/landmark")
+def get_landmark_state() -> dict:
+    return {"enabled": landmark_enabled}
+
+
+@app.post("/landmark")
+def set_landmark_state(payload: LandmarkToggleRequest) -> dict:
+    global landmark_enabled
+    landmark_enabled = payload.enabled
+    return {"enabled": landmark_enabled}
+
+
+@app.post("/status", response_model=StatusState)
+def update_status(payload: StatusUpdateRequest) -> StatusState:
+    # 외부 업데이트도 호환 유지하되, 통합 백엔드에서는 기본적으로 내부 인식 루프가 상태를 관리한다.
+    with state_lock:
+        updated = StatusState(**payload.model_dump())
+        global current_status
+        current_status = updated
+        return current_status.model_copy(deep=True)
+
+
+@app.post("/command", response_model=StatusState)
+def send_command(payload: CommandRequest) -> StatusState:
+    command = payload.command
+
+    if command == "STOP":
+        robot_status = "Stopped"
+    elif command == "RESUME":
+        robot_status = "Moving"
+    elif command in {"LEFT", "RIGHT"}:
+        robot_status = "Moving"
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported command")
+
+    with state_lock:
+        global current_status
+        current_status = current_status.model_copy(
+            update={
+                "mode": "OVERRIDE",
+                "command": command,
+                "robot_status": robot_status,
+                "source": "web",
+            }
+        )
+        return current_status.model_copy(deep=True)
+
+
+@app.get("/stream/laptop.mjpg")
+def stream_laptop_camera():
+    return StreamingResponse(
+        mjpeg_frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 @app.on_event("startup")
-async def _startup() -> None:
-    # Start the background loop that updates state every 1 second.
-    asyncio.create_task(gesture_recognition_loop())
+def startup_camera_worker() -> None:
+    global camera_worker_running, camera_worker_thread
+    camera_worker_running = True
+    camera_worker_thread = Thread(target=camera_worker_loop, daemon=True)
+    camera_worker_thread.start()
 
 
-@app.get("/status")
-def get_status():
-    return JSONResponse(content=_build_status_payload())
+@app.get("/")
+def serve_frontend_index() -> FileResponse:
+    return FileResponse(FRONTEND_DIR / "index.html")
 
 
-@app.post("/command")
-def post_command(payload: dict = Body(...)):
-    """
-    Expected payload:
-      { "command": "STOP" | "RESUME" | "LEFT" | "RIGHT" }
-
-    On any manual command, the system switches to OVERRIDE immediately.
-    """
-    if not isinstance(payload, dict) or "command" not in payload:
-        raise HTTPException(status_code=400, detail="Missing 'command' field")
-
-    command = payload.get("command")
-    if not isinstance(command, str) or command not in ALLOWED_COMMANDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid command. Allowed: {sorted(ALLOWED_COMMANDS)}",
-        )
-
-    command_lit: Command = command  # type narrowing for readability
-    robot_status = _compute_robot_status_from_command(command_lit)
-
-    # When operator overrides, we stop using gesture recognition for commands.
-    _set_state(
-        mode="OVERRIDE",
-        command=command_lit,
-        robot_status=robot_status,
-        # Gesture display: indicate that command is manual.
-        gesture="manual",
-        confidence=1.0,
-        last_manual_ts=time.time(),
-    )
-
-    return JSONResponse(content={"ok": True, "status": _build_status_payload()})
+# /style.css, /app.js 등 정적 파일 서빙
+app.mount("/", StaticFiles(directory=FRONTEND_DIR), name="frontend-static")
 
 
-# ----------------------------
-# Static frontend
-# ----------------------------
-
-from pathlib import Path  # noqa: E402
-
-THIS_DIR = Path(__file__).resolve().parent
-FRONTEND_DIR = (THIS_DIR.parent / "frontend").resolve()
-
-if FRONTEND_DIR.exists():
-    # Important: mount static AFTER API routes are registered, so /status and /command keep working.
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
-else:
-    # Fallback: keep API working even if frontend isn't present yet.
-    pass
+@app.on_event("shutdown")
+def shutdown_camera() -> None:
+    global camera_capture, camera_worker_running, camera_worker_thread
+    camera_worker_running = False
+    if camera_worker_thread is not None:
+        camera_worker_thread.join(timeout=1.0)
+    camera_worker_thread = None
+    with camera_lock:
+        if camera_capture is not None and camera_capture.isOpened():
+            camera_capture.release()
+        camera_capture = None
 

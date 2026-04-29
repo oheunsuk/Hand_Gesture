@@ -1,104 +1,210 @@
-const els = {
+const API_BASE_URL = "";
+
+const el = {
+  modeCard: document.getElementById("mode-card"),
   modeValue: document.getElementById("mode-value"),
-  modeHint: document.getElementById("mode-hint"),
+  sourceCard: document.getElementById("source-card"),
+  sourceValue: document.getElementById("source-value"),
   gestureValue: document.getElementById("gesture-value"),
-  confidenceValue: document.getElementById("confidence-value"),
+  stableGestureValue: document.getElementById("stable-gesture-value"),
   commandValue: document.getElementById("command-value"),
   robotStatusValue: document.getElementById("robot-status-value"),
-  errorArea: document.getElementById("error-area"),
-  cardMode: document.getElementById("card-mode"),
-  errorTimer: null,
+  laptopCamera: document.getElementById("laptop-camera"),
+  landmarkToggleBtn: document.getElementById("landmark-toggle-btn"),
+  connectionStatus: document.getElementById("connection-status"),
+  message: document.getElementById("message"),
+  buttons: document.querySelectorAll("[data-command]"),
 };
 
-function setError(message) {
-  if (!message) return;
-  els.errorArea.hidden = false;
-  els.errorArea.textContent = message;
+let landmarkEnabled = false;
+
+function setConnected(connected) {
+  if (connected) {
+    el.connectionStatus.textContent = "Server Connected";
+    el.connectionStatus.classList.add("online");
+    el.connectionStatus.classList.remove("offline");
+    return;
+  }
+  el.connectionStatus.textContent = "Server Disconnected";
+  el.connectionStatus.classList.remove("online");
+  el.connectionStatus.classList.add("offline");
 }
 
-function clearError() {
-  els.errorArea.hidden = true;
-  els.errorArea.textContent = "";
+function setMessage(message, isError = false) {
+  el.message.textContent = message || "";
+  el.message.style.color = isError ? "#ff9d9d" : "#ffd67a";
 }
 
-function confidenceToPercent(confidence) {
-  const n = Number(confidence);
-  if (!Number.isFinite(n)) return "-";
-  return `${Math.round(n * 100)}%`;
+function normalizeRobotStatus(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "moving") return "Moving";
+  if (raw === "stopped") return "Stopped";
+  return value || "-";
 }
 
-function updateUI(status) {
-  const mode = status.mode ?? "-";
-  const gesture = status.gesture ?? "-";
-  const confidence = status.confidence;
-  const command = status.command ?? "-";
-  const robotStatus = status.robot_status ?? "-";
+function updateView(status) {
+  const mode = String(status.mode || "AUTO").toUpperCase();
+  const source = String(status.source || "gesture").toLowerCase();
+  const gesture = String(status.gesture || "unknown");
+  const stableGesture = String(status.stable_gesture || "unknown");
+  const command = String(status.command || "NONE").toUpperCase();
+  const robotStatus = normalizeRobotStatus(status.robot_status);
 
-  els.modeValue.textContent = mode;
-  els.modeHint.textContent = mode === "AUTO" ? "제스처 인식 결과로 제어합니다." : "수동 명령이 우선합니다.";
-  els.cardMode.dataset.mode = mode;
+  el.modeValue.textContent = mode;
+  el.gestureValue.textContent = gesture;
+  el.stableGestureValue.textContent = stableGesture;
+  el.commandValue.textContent = command;
+  el.robotStatusValue.textContent = robotStatus;
 
-  els.gestureValue.textContent = gesture;
-  els.confidenceValue.textContent = confidenceToPercent(confidence);
-  els.commandValue.textContent = command;
-  els.robotStatusValue.textContent =
-    robotStatus === "moving" ? "Moving" : robotStatus === "stopped" ? "Stopped" : String(robotStatus);
-  els.robotStatusValue.dataset.status = String(robotStatus).toLowerCase();
-}
+  el.modeCard.classList.remove("mode-auto", "mode-override");
+  if (mode === "OVERRIDE") {
+    el.modeCard.classList.add("mode-override");
+  } else {
+    el.modeCard.classList.add("mode-auto");
+  }
 
-async function fetchStatus() {
-  try {
-    const res = await fetch("/status", { method: "GET" });
-    if (!res.ok) {
-      throw new Error(`상태 조회 실패: HTTP ${res.status}`);
+  // 제어 입력 출처(gesture/web)를 텍스트와 색상으로 동시에 표시한다.
+  if (el.sourceCard && el.sourceValue) {
+    el.sourceCard.classList.remove("gesture", "web");
+    if (source === "web") {
+      el.sourceCard.classList.add("web");
+      el.sourceValue.textContent = "Web";
+    } else {
+      el.sourceCard.classList.add("gesture");
+      el.sourceValue.textContent = "Gesture";
     }
-    const status = await res.json();
-    clearError();
-    updateUI(status);
-  } catch (err) {
-    setError(err?.message || "상태 조회 중 오류가 발생했습니다.");
   }
 }
 
-async function postCommand(command) {
+function updateLandmarkToggleButton() {
+  if (!el.landmarkToggleBtn) return;
+  el.landmarkToggleBtn.classList.remove("on", "off");
+  if (landmarkEnabled) {
+    el.landmarkToggleBtn.classList.add("on");
+    el.landmarkToggleBtn.textContent = "Landmark ON";
+  } else {
+    el.landmarkToggleBtn.classList.add("off");
+    el.landmarkToggleBtn.textContent = "Landmark OFF";
+  }
+}
+
+async function getStatus() {
+  const response = await fetch(`${API_BASE_URL}/status`, { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch status: ${response.status}`);
+  }
+  return response.json();
+}
+
+async function refreshStatus() {
   try {
-    const res = await fetch("/command", {
+    const status = await getStatus();
+    updateView(status);
+    setConnected(true);
+  } catch (error) {
+    setConnected(false);
+    setMessage("Server Disconnected", true);
+  }
+}
+
+async function sendCommand(command) {
+  el.buttons.forEach((button) => {
+    button.disabled = true;
+  });
+
+  try {
+    const response = await fetch(`${API_BASE_URL}/command`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({ command }),
     });
-    if (!res.ok) {
-      let detail = "";
-      try {
-        const data = await res.json();
-        detail = data?.detail ? ` (${data.detail})` : "";
-      } catch (_) {}
-      throw new Error(`명령 전송 실패: HTTP ${res.status}${detail}`);
+
+    if (!response.ok) {
+      throw new Error(`Command failed: ${response.status}`);
     }
-    clearError();
-    // 버튼 클릭 시 즉시 반영 (서버 상태가 갱신된 값을 다시 가져옴)
-    await fetchStatus();
-  } catch (err) {
-    setError(err?.message || "명령 전송 중 오류가 발생했습니다.");
+
+    const status = await response.json();
+    updateView(status);
+    setConnected(true);
+    setMessage(`Command sent: ${command}`);
+  } catch (error) {
+    setConnected(false);
+    setMessage("Command send failed", true);
+  } finally {
+    el.buttons.forEach((button) => {
+      button.disabled = false;
+    });
   }
 }
 
-function wireButtons() {
-  document.querySelectorAll("[data-command]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const cmd = btn.getAttribute("data-command");
-      if (!cmd) return;
-      await postCommand(cmd);
+async function loadLandmarkState() {
+  try {
+    const response = await fetch(`${API_BASE_URL}/landmark`, { method: "GET" });
+    if (!response.ok) return;
+    const data = await response.json();
+    landmarkEnabled = Boolean(data.enabled);
+    updateLandmarkToggleButton();
+  } catch (error) {
+    // 랜드마크 상태 조회 실패는 스트림/상태 동작에 영향 없으므로 조용히 무시한다.
+  }
+}
+
+async function toggleLandmark() {
+  const nextState = !landmarkEnabled;
+  try {
+    const response = await fetch(`${API_BASE_URL}/landmark`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: nextState }),
+    });
+    if (!response.ok) {
+      throw new Error("Landmark toggle failed");
+    }
+    const data = await response.json();
+    landmarkEnabled = Boolean(data.enabled);
+    updateLandmarkToggleButton();
+  } catch (error) {
+    setMessage("Landmark toggle failed", true);
+  }
+}
+
+function bindButtons() {
+  el.buttons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const command = button.dataset.command;
+      if (!command) return;
+      sendCommand(command);
     });
   });
 }
 
-function startPolling() {
-  // 즉시 1회, 이후 1초마다 갱신
-  fetchStatus();
-  setInterval(fetchStatus, 1000);
+function bindLandmarkToggleButton() {
+  if (!el.landmarkToggleBtn) return;
+  el.landmarkToggleBtn.addEventListener("click", () => {
+    toggleLandmark();
+  });
 }
 
-wireButtons();
-startPolling();
+async function startLaptopCamera() {
+  if (!el.laptopCamera) return;
+  const streamUrl = `${API_BASE_URL}/stream/laptop.mjpg`;
+  el.laptopCamera.src = streamUrl;
+  el.laptopCamera.onerror = () => {
+    setMessage("Laptop camera stream disconnected", true);
+  };
+}
+
+function start() {
+  bindButtons();
+  bindLandmarkToggleButton();
+  updateLandmarkToggleButton(); // 기본 상태는 OFF로 시작
+  loadLandmarkState();
+  startLaptopCamera();
+  refreshStatus();
+  window.setInterval(refreshStatus, 500);
+}
+
+start();
 

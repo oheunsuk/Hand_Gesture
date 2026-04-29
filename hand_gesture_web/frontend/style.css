@@ -1,0 +1,264 @@
+:root {
+  --bg: #0f1220;
+  --card: #1b2035;
+  --card-soft: #222946;
+  --text: #f5f7ff;
+  --muted: #a9b2d0;
+  --green: #22c55e;
+  --red: #ef4444;
+  --blue: #3b82f6;
+  --yellow: #f59e0b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Arial, sans-serif;
+  background: radial-gradient(circle at 10% 10%, #1a1f37, var(--bg));
+  color: var(--text);
+  min-height: 100vh;
+}
+
+.container {
+  width: min(1100px, 94vw);
+  margin: 28px auto;
+  display: grid;
+  gap: 18px;
+}
+
+.card {
+  background: linear-gradient(145deg, var(--card), var(--card-soft));
+  border: 1px solid #2f3a63;
+  border-radius: 16px;
+  padding: 20px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.25);
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 8px 0 6px;
+  font-size: clamp(26px, 4vw, 38px);
+}
+
+.subtext {
+  margin: 0;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.connection {
+  padding: 10px 14px;
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.connection.online {
+  color: #b8ffd0;
+  background: rgba(34, 197, 94, 0.2);
+  border: 1px solid rgba(34, 197, 94, 0.55);
+}
+
+.connection.offline {
+  color: #ffd0d0;
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid rgba(239, 68, 68, 0.55);
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.status-card h2 {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.value {
+  margin: 0;
+  font-size: clamp(24px, 3.2vw, 40px);
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+#mode-card.mode-auto .value {
+  color: var(--green);
+}
+
+#mode-card.mode-override .value {
+  color: var(--red);
+}
+
+#source-card.gesture .value {
+  color: #22c55e;
+}
+
+#source-card.web .value {
+  color: #3b82f6;
+}
+
+.command-card .value {
+  color: var(--yellow);
+}
+
+.camera-panel h2 {
+  margin: 0 0 14px;
+  font-size: 26px;
+}
+
+.camera-panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.camera-panel-head h2 {
+  margin: 0;
+}
+
+.landmark-toggle {
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 800;
+  color: #fff;
+  cursor: pointer;
+}
+
+.landmark-toggle.off {
+  background: #6b7280;
+}
+
+.landmark-toggle.on {
+  background: #3b82f6;
+}
+
+.camera-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.camera-card {
+  background: rgba(8, 11, 21, 0.6);
+  border: 1px solid #2f3a63;
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.camera-card h3 {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+#laptop-camera,
+#robot-camera {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 12px;
+  background: #000;
+  object-fit: cover;
+  display: block;
+}
+
+.robot-camera-placeholder {
+  display: grid;
+  gap: 8px;
+}
+
+.robot-camera-placeholder p {
+  margin: 0;
+  color: #d2d8ef;
+  font-size: 14px;
+  text-align: center;
+}
+
+.control-panel h2 {
+  margin: 0 0 14px;
+  font-size: 26px;
+}
+
+.button-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.control-button {
+  border: 0;
+  border-radius: 12px;
+  padding: 16px 10px;
+  font-size: 20px;
+  font-weight: 800;
+  color: #fff;
+  cursor: pointer;
+  transition: transform 0.08s ease, opacity 0.2s;
+}
+
+.control-button:active {
+  transform: translateY(2px);
+}
+
+.control-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.stop {
+  background: var(--red);
+}
+
+.resume {
+  background: var(--green);
+}
+
+.side {
+  background: var(--blue);
+}
+
+.message {
+  min-height: 24px;
+  margin: 12px 2px 0;
+  color: #ffd67a;
+  font-size: 15px;
+}
+
+@media (max-width: 980px) {
+  .status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .button-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .camera-grid {
+    grid-template-columns: 1fr;
+  }
+}

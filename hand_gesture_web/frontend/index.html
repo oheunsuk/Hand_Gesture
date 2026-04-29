@@ -3,99 +3,85 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>손 제스처 로봇 제어</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <title>Hand Gesture Robot Control</title>
+    <link rel="stylesheet" href="./style.css" />
   </head>
-
   <body>
-    <div class="app">
-      <header class="topbar">
-        <div class="title-wrap">
-          <span class="chip chip--live">LIVE</span>
+    <main class="container">
+      <header class="header card">
+        <div>
+          <p class="eyebrow">Academic Demo</p>
           <h1>손 제스처 기반 로봇 제어</h1>
-          <p class="subtitle">AUTO / OVERRIDE 상태를 실시간 확인하고, 필요 시 수동 제어하세요.</p>
+          <p class="subtext">0.5초 주기로 상태를 자동 동기화합니다.</p>
         </div>
-        <div class="chip-group">
-          <span class="chip chip--soft">Polling 1s</span>
-          <span class="chip chip--soft">FastAPI</span>
-        </div>
+        <div id="connection-status" class="connection online">Server Connected</div>
       </header>
 
-      <section class="section-head">
-        <h2>실시간 상태</h2>
-        <span class="section-head__desc">Robot Telemetry</span>
+      <section class="status-grid">
+        <article id="mode-card" class="card status-card">
+          <h2>Mode</h2>
+          <p id="mode-value" class="value">AUTO</p>
+        </article>
+
+        <article id="source-card" class="card status-card gesture">
+          <h2>Control Source</h2>
+          <p id="source-value" class="value">Gesture</p>
+        </article>
+
+        <article class="card status-card">
+          <h2>Gesture</h2>
+          <p id="gesture-value" class="value">unknown</p>
+        </article>
+
+        <article class="card status-card">
+          <h2>Stable Gesture</h2>
+          <p id="stable-gesture-value" class="value">unknown</p>
+        </article>
+
+        <article id="command-card" class="card status-card command-card">
+          <h2>Command</h2>
+          <p id="command-value" class="value">NONE</p>
+        </article>
+
+        <article class="card status-card">
+          <h2>Robot Status</h2>
+          <p id="robot-status-value" class="value">Moving</p>
+        </article>
       </section>
 
-      <section class="grid">
-        <div id="card-mode" class="card card--mode card--accent-green">
-          <div class="card__label">현재 모드</div>
-          <div id="mode-value" class="card__value">-</div>
-          <div id="mode-hint" class="card__hint"></div>
+      <section class="card camera-panel">
+        <div class="camera-panel-head">
+          <h2>Camera View</h2>
+          <button id="landmark-toggle-btn" class="landmark-toggle off" type="button">Landmark OFF</button>
         </div>
-
-        <div class="card card--accent-blue">
-          <div class="card__label">인식된 제스처</div>
-          <div id="gesture-value" class="card__value">-</div>
-        </div>
-
-        <div class="card card--accent-violet">
-          <div class="card__label">confidence</div>
-          <div id="confidence-value" class="card__value">-</div>
-        </div>
-
-        <div class="card card--accent-cyan">
-          <div class="card__label">실행 명령</div>
-          <div id="command-value" class="card__value">-</div>
-        </div>
-
-        <div class="card card--accent-gray">
-          <div class="card__label">로봇 상태</div>
-          <div id="robot-status-value" class="card__value status-badge">-</div>
-        </div>
-      </section>
-
-      <section class="camera-panel">
-        <div class="panel__title">카메라 뷰 (2채널)</div>
         <div class="camera-grid">
-          <div class="camera-slot">
-            <div class="camera-slot__header">
-              <span class="camera-slot__title">로봇 카메라</span>
-              <span class="camera-slot__state">대기중</span>
+          <article class="camera-card">
+            <h3>노트북 카메라</h3>
+            <img id="laptop-camera" alt="Laptop Camera Stream" />
+          </article>
+          <article class="camera-card">
+            <h3>로봇 카메라</h3>
+            <div class="robot-camera-placeholder">
+              <video id="robot-camera" autoplay playsinline muted></video>
+              <p>Robot Camera (Not Connected)</p>
             </div>
-            <div class="camera-slot__body">
-              <div class="camera-slot__placeholder">영상 소스를 연결하세요</div>
-            </div>
-          </div>
-          <div class="camera-slot">
-            <div class="camera-slot__header">
-              <span class="camera-slot__title">노트북 카메라</span>
-              <span class="camera-slot__state">대기중</span>
-            </div>
-            <div class="camera-slot__body">
-              <div class="camera-slot__placeholder">영상 소스를 연결하세요</div>
-            </div>
-          </div>
+          </article>
         </div>
       </section>
 
-      <section class="panel">
-        <div class="panel__title">fallback 제어</div>
-        <div class="panel__buttons">
-          <button class="btn btn--danger" data-command="STOP">■ STOP</button>
-          <button class="btn btn--primary" data-command="RESUME">▶ RESUME</button>
-          <button class="btn btn--secondary" data-command="LEFT">← LEFT</button>
-          <button class="btn btn--secondary" data-command="RIGHT">RIGHT →</button>
+      <section class="card control-panel">
+        <h2>Fallback Control</h2>
+        <div class="button-grid">
+          <button class="control-button stop" data-command="STOP">STOP</button>
+          <button class="control-button resume" data-command="RESUME">RESUME</button>
+          <button class="control-button side" data-command="LEFT">LEFT</button>
+          <button class="control-button side" data-command="RIGHT">RIGHT</button>
         </div>
-
-        <div id="error-area" class="error" role="alert" aria-live="polite" hidden></div>
+        <p id="message" class="message" aria-live="polite"></p>
       </section>
+    </main>
 
-      <footer class="footer">
-        상태는 1초마다 자동 갱신되며, 버튼 클릭 시 즉시 반영됩니다.
-      </footer>
-    </div>
-
-    <script src="/app.js"></script>
+    <script src="./app.js"></script>
   </body>
 </html>
 
