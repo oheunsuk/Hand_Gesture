@@ -16,6 +16,7 @@ from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
 from mediapipe.python.solutions.hands_connections import HAND_CONNECTIONS
 from pydantic import BaseModel
+from tensorflow.keras.models import load_model
 
 
 # 실행 방법:
@@ -72,6 +73,10 @@ camera_worker_running = False
 camera_worker_thread: Thread | None = None
 landmark_enabled = False
 show_overlay = True
+GESTURE_CLASSES = ["palm", "fist", "thumb"]
+SEQUENCE_LENGTH = 20
+SMOOTHING_LENGTH = 5
+gesture_model = load_model("gesture_lstm.h5")
 
 
 def ensure_hand_landmarker_model() -> Path:
@@ -95,6 +100,21 @@ def detect_raw_gesture(hand_landmarks) -> str:
     if extended_count <= 1:
         return "fist"
     return "unknown"
+
+
+def decode_prediction(prediction: np.ndarray) -> str:
+    class_index = int(np.argmax(prediction, axis=1)[0])
+    return GESTURE_CLASSES[class_index]
+
+
+def get_smoothed_gesture(prediction_history: deque[str]) -> tuple[str, int]:
+    if not prediction_history:
+        return "unknown", 0
+    history_list = list(prediction_history)
+    labels = GESTURE_CLASSES + ["unknown"]
+    count_map = {label: history_list.count(label) for label in labels}
+    smoothed_gesture = max(count_map, key=count_map.get)
+    return smoothed_gesture, count_map[smoothed_gesture]
 
 
 def gesture_to_command(stable_gesture: str) -> CommandType:
@@ -161,9 +181,8 @@ def camera_worker_loop() -> None:
         min_tracking_confidence=0.7,
         min_hand_presence_confidence=0.7,
     )
-    history: deque[str] = deque(maxlen=10)
-    last_candidate = "unknown"
-    candidate_start = time.monotonic()
+    sequence_buffer: deque[np.ndarray] = deque(maxlen=SEQUENCE_LENGTH)
+    prediction_history: deque[str] = deque(maxlen=SMOOTHING_LENGTH)
 
     with vision.HandLandmarker.create_from_options(options) as detector:
         while camera_worker_running:
@@ -194,34 +213,28 @@ def camera_worker_loop() -> None:
             result = detector.detect_for_video(mp_image, timestamp_ms)
 
             if result.hand_landmarks:
-                gesture = detect_raw_gesture(result.hand_landmarks[0])
+                hand_landmarks = result.hand_landmarks[0]
+                landmark_array = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks], dtype=np.float32)
+                sequence_buffer.append(landmark_array)
+
+                if len(sequence_buffer) == SEQUENCE_LENGTH:
+                    input_tensor = np.array(sequence_buffer, dtype=np.float32)
+                    input_tensor = input_tensor.reshape(1, SEQUENCE_LENGTH, 63)
+                    prediction = gesture_model.predict(input_tensor, verbose=0)
+                    gesture = decode_prediction(prediction)
+                else:
+                    gesture = "unknown"
+
                 # 랜드마크 토글이 켜진 경우에만 오버레이를 그린다.
                 if landmark_enabled:
-                    draw_hand_landmarks(frame, result.hand_landmarks[0])
+                    draw_hand_landmarks(frame, hand_landmarks)
             else:
+                sequence_buffer.clear()
                 gesture = "unknown"
 
-            history.append(gesture)
-            if len(history) < 10:
-                stable_candidate = "unknown"
-                dominant_count = 0
-            else:
-                count_map = {
-                    "palm": list(history).count("palm"),
-                    "fist": list(history).count("fist"),
-                    "unknown": list(history).count("unknown"),
-                }
-                stable_candidate = max(count_map, key=count_map.get)
-                dominant_count = count_map[stable_candidate]
-                if dominant_count < 8:
-                    stable_candidate = "unknown"
-
+            prediction_history.append(gesture)
+            stable_gesture, _ = get_smoothed_gesture(prediction_history)
             now = time.monotonic()
-            if stable_candidate != last_candidate:
-                last_candidate = stable_candidate
-                candidate_start = now
-            hold_seconds = now - candidate_start
-            stable_gesture = stable_candidate if (stable_candidate != "unknown" and hold_seconds >= 0.5) else "unknown"
 
             auto_command = gesture_to_command(stable_gesture)
             auto_robot_status = "Stopped" if auto_command == "STOP" else "Moving"

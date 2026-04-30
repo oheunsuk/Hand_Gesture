@@ -1,16 +1,22 @@
 import time
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 import cv2
 import mediapipe as mp
+import numpy as np
 import requests
 from mediapipe.python.solutions.hands_connections import HAND_CONNECTIONS
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
+from tensorflow.keras.models import load_model
 
 STATUS_ENDPOINT = "http://localhost:8000/status"
 SEND_INTERVAL_SEC = 0.2
+GESTURE_CLASSES = ["palm", "fist", "thumb"]
+SEQUENCE_LENGTH = 20
+SMOOTHING_LENGTH = 5
 
 
 def ensure_hand_landmarker_model() -> Path:
@@ -31,21 +37,9 @@ def ensure_hand_landmarker_model() -> Path:
     return model_path
 
 
-def detect_raw_gesture(hand_landmarks) -> str:
-    """
-    랜드마크 기반 원시 제스처를 판별한다.
-    - palm: 손가락 끝(8,12,16,20) 중 4개 이상이 PIP 관절(6,10,14,18)보다 위(y 작음)
-    - fist: 손가락 끝이 대부분 접힌 상태(위 조건을 거의 만족하지 않음)
-    - unknown: 그 외
-    """
-    tip_pip_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
-    extended_count = sum(1 for tip, pip in tip_pip_pairs if hand_landmarks[tip].y < hand_landmarks[pip].y)
-
-    if extended_count >= 4:
-        return "palm"
-    if extended_count <= 1:
-        return "fist"
-    return "unknown"
+def decode_prediction(prediction: np.ndarray) -> str:
+    class_index = int(np.argmax(prediction, axis=1)[0])
+    return GESTURE_CLASSES[class_index]
 
 
 def draw_hand_landmarks(frame, hand_landmarks):
@@ -64,25 +58,14 @@ def draw_hand_landmarks(frame, hand_landmarks):
             cv2.line(frame, points[start_idx], points[end_idx], (255, 0, 0), 2, cv2.LINE_AA)
 
 
-def get_stable_gesture(gesture_history: list[str]) -> tuple[str, int]:
-    """
-    최근 프레임 버퍼에서 안정 제스처 후보를 계산한다.
-    - 최근 10프레임 중 동일 제스처 8프레임 이상
-    반환: (gesture, count)
-    """
-    if len(gesture_history) < 10:
+def get_smoothed_gesture(prediction_history: deque[str]) -> tuple[str, int]:
+    if not prediction_history:
         return "unknown", 0
-
-    count_map = {
-        "palm": gesture_history.count("palm"),
-        "fist": gesture_history.count("fist"),
-        "unknown": gesture_history.count("unknown"),
-    }
-    dominant_gesture = max(count_map, key=count_map.get)
-    dominant_count = count_map[dominant_gesture]
-    if dominant_count >= 8:
-        return dominant_gesture, dominant_count
-    return "unknown", dominant_count
+    history_list = list(prediction_history)
+    labels = GESTURE_CLASSES + ["unknown"]
+    count_map = {label: history_list.count(label) for label in labels}
+    smoothed_gesture = max(count_map, key=count_map.get)
+    return smoothed_gesture, count_map[smoothed_gesture]
 
 
 def gesture_to_command(stable_gesture: str) -> str:
@@ -113,15 +96,15 @@ def draw_main_ui(frame, mode: str, command: str, robot_status: str):
 
 
 def draw_debug_ui(
-    frame, gesture: str, stable_gesture: str, dominant_count: int, gesture_history: list[str], hold_seconds: float
+    frame, gesture: str, stable_gesture: str, smoothing_count: int, prediction_history: list[str], hold_seconds: float
 ):
     """디버그 ON일 때만 보이는 작은 상태 텍스트."""
     y = 160
     debug_lines = [
         f"Gesture: {gesture}",
         f"Stable Gesture: {stable_gesture}",
-        f"Frame Count: {dominant_count}/10",
-        f"History Size: {len(gesture_history)}",
+        f"Frame Count: {smoothing_count}/5",
+        f"History Size: {len(prediction_history)}",
         f"Hold: {hold_seconds:.2f}s",
     ]
     for line in debug_lines:
@@ -150,6 +133,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+    model = load_model("gesture_lstm.h5")
     model_path = ensure_hand_landmarker_model()
     options = vision.HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(model_path)),
@@ -161,15 +145,10 @@ def main():
     )
 
     gesture = "unknown"  # 현재 프레임 원시 제스처
-    stable_candidate = "unknown"  # 프레임 일관성 조건을 통과한 후보
-    stable_gesture = "unknown"  # 일관성 + 유지시간을 둘 다 통과한 최종 제스처
-
-    # 최근 10프레임 제스처 결과를 저장하는 버퍼
-    gesture_history = []
-
-    # 안정 후보(stable_candidate)가 연속 유지된 시간을 측정
-    candidate_start_time = time.monotonic()
-    last_candidate = "unknown"
+    stable_gesture = "unknown"
+    smoothing_count = 0
+    sequence_buffer = deque(maxlen=SEQUENCE_LENGTH)
+    prediction_history = deque(maxlen=SMOOTHING_LENGTH)
 
     # 테스트용 모드/명령 상태
     mode = "AUTO"
@@ -201,29 +180,23 @@ def main():
                 # 'l' 토글이 켜진 경우에만 랜드마크를 그린다.
                 if show_landmarks:
                     draw_hand_landmarks(display_frame, hand_landmarks)
-                gesture = detect_raw_gesture(hand_landmarks)
+                landmark_array = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks], dtype=np.float32)
+                sequence_buffer.append(landmark_array)
+                if len(sequence_buffer) == SEQUENCE_LENGTH:
+                    input_tensor = np.array(sequence_buffer, dtype=np.float32)
+                    input_tensor = input_tensor.reshape(1, SEQUENCE_LENGTH, 63)
+                    prediction = model.predict(input_tensor, verbose=0)
+                    gesture = decode_prediction(prediction)
+                else:
+                    gesture = "unknown"
             else:
+                sequence_buffer.clear()
                 gesture = "unknown"
 
-            # 프레임 버퍼(최근 10개) 업데이트
-            gesture_history.append(gesture)
-            if len(gesture_history) > 10:
-                gesture_history.pop(0)
-
-            # 1) 프레임 일관성 조건 판단
-            stable_candidate, dominant_count = get_stable_gesture(gesture_history)
-
-            # 2) 유지 시간 조건 판단(같은 candidate가 0.5초 이상)
+            prediction_history.append(gesture)
+            stable_gesture, smoothing_count = get_smoothed_gesture(prediction_history)
+            hold_seconds = 0.0
             now = time.monotonic()
-            if stable_candidate != last_candidate:
-                last_candidate = stable_candidate
-                candidate_start_time = now
-            hold_seconds = now - candidate_start_time
-
-            if stable_candidate != "unknown" and hold_seconds >= 0.5:
-                stable_gesture = stable_candidate
-            else:
-                stable_gesture = "unknown"
 
             # 안정 제스처를 명령으로 매핑
             command = gesture_to_command(stable_gesture)
@@ -238,7 +211,14 @@ def main():
 
             draw_main_ui(display_frame, mode, command, robot_status)
             if show_debug:
-                draw_debug_ui(display_frame, gesture, stable_gesture, dominant_count, gesture_history, hold_seconds)
+                draw_debug_ui(
+                    display_frame,
+                    gesture,
+                    stable_gesture,
+                    smoothing_count,
+                    list(prediction_history),
+                    hold_seconds,
+                )
 
             # 상태가 바뀌면 백엔드 전송 대기열(pending)에 등록한다.
             current_payload = {

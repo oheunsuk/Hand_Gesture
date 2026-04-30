@@ -5,14 +5,19 @@ from pathlib import Path
 
 import cv2
 import mediapipe as mp
+import numpy as np
 import requests
 from mediapipe.python.solutions.hands_connections import HAND_CONNECTIONS
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
+from tensorflow.keras.models import load_model
 
 STATUS_ENDPOINT = "http://localhost:8000/status"
 SEND_INTERVAL_SEC = 0.2
 SWIPE_COOLDOWN_SEC = 1.0
+GESTURE_CLASSES = ["palm", "fist", "thumb"]
+SEQUENCE_LENGTH = 20
+SMOOTHING_LENGTH = 5
 
 
 def ensure_hand_landmarker_model() -> Path:
@@ -33,21 +38,9 @@ def ensure_hand_landmarker_model() -> Path:
     return model_path
 
 
-def detect_raw_gesture(hand_landmarks) -> str:
-    """
-    랜드마크 기반 원시 제스처를 판별한다.
-    - palm: 손가락 끝(8,12,16,20) 중 4개 이상이 PIP 관절(6,10,14,18)보다 위(y 작음)
-    - fist: 손가락 끝이 대부분 접힌 상태(위 조건을 거의 만족하지 않음)
-    - unknown: 그 외
-    """
-    tip_pip_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
-    extended_count = sum(1 for tip, pip in tip_pip_pairs if hand_landmarks[tip].y < hand_landmarks[pip].y)
-
-    if extended_count >= 4:
-        return "palm"
-    if extended_count <= 1:
-        return "fist"
-    return "unknown"
+def decode_prediction(prediction: np.ndarray) -> str:
+    class_index = int(np.argmax(prediction, axis=1)[0])
+    return GESTURE_CLASSES[class_index]
 
 
 def draw_hand_landmarks(frame, hand_landmarks):
@@ -66,25 +59,14 @@ def draw_hand_landmarks(frame, hand_landmarks):
             cv2.line(frame, points[start_idx], points[end_idx], (255, 0, 0), 2, cv2.LINE_AA)
 
 
-def get_stable_gesture(gesture_history: list[str]) -> tuple[str, int]:
-    """
-    최근 프레임 버퍼에서 안정 제스처 후보를 계산한다.
-    - 최근 10프레임 중 동일 제스처 8프레임 이상
-    반환: (gesture, count)
-    """
-    if len(gesture_history) < 10:
+def get_smoothed_gesture(prediction_history: deque[str]) -> tuple[str, int]:
+    if not prediction_history:
         return "unknown", 0
-
-    count_map = {
-        "palm": gesture_history.count("palm"),
-        "fist": gesture_history.count("fist"),
-        "unknown": gesture_history.count("unknown"),
-    }
-    dominant_gesture = max(count_map, key=count_map.get)
-    dominant_count = count_map[dominant_gesture]
-    if dominant_count >= 8:
-        return dominant_gesture, dominant_count
-    return "unknown", dominant_count
+    history_list = list(prediction_history)
+    labels = GESTURE_CLASSES + ["unknown"]
+    count_map = {label: history_list.count(label) for label in labels}
+    smoothed_gesture = max(count_map, key=count_map.get)
+    return smoothed_gesture, count_map[smoothed_gesture]
 
 
 def detect_swipe_gesture(wrist_x_history: deque) -> str:
@@ -141,8 +123,8 @@ def draw_debug_ui(
     frame,
     gesture: str,
     stable_gesture: str,
-    dominant_count: int,
-    gesture_history: list[str],
+    smoothing_count: int,
+    prediction_history: list[str],
     hold_seconds: float,
     swipe_gesture: str,
     wrist_delta_x: float,
@@ -154,8 +136,8 @@ def draw_debug_ui(
         f"Stable Gesture: {stable_gesture}",
         f"Swipe: {swipe_gesture}",
         f"Wrist delta_x(20): {wrist_delta_x:.3f}",
-        f"Frame Count: {dominant_count}/10",
-        f"History Size: {len(gesture_history)}",
+        f"Frame Count: {smoothing_count}/5",
+        f"History Size: {len(prediction_history)}",
         f"Hold: {hold_seconds:.2f}s",
     ]
     for line in debug_lines:
@@ -184,6 +166,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+    model = load_model("gesture_lstm.h5")
     model_path = ensure_hand_landmarker_model()
     options = vision.HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(model_path)),
@@ -195,19 +178,15 @@ def main():
     )
 
     gesture = "unknown"  # 현재 프레임 원시 제스처
-    stable_candidate = "unknown"  # 프레임 일관성 조건을 통과한 후보
-    stable_gesture = "unknown"  # 일관성 + 유지시간을 둘 다 통과한 최종 제스처
+    stable_gesture = "unknown"
     swipe_gesture = "unknown"
     wrist_delta_x = 0.0
+    smoothing_count = 0
 
-    # 최근 10프레임 제스처 결과를 저장하는 버퍼
-    gesture_history = []
+    sequence_buffer = deque(maxlen=SEQUENCE_LENGTH)
+    prediction_history = deque(maxlen=SMOOTHING_LENGTH)
     # 최근 20프레임 손목 x 좌표 버퍼 (swipe 판단용)
     wrist_x_history = deque(maxlen=20)
-
-    # 안정 후보(stable_candidate)가 연속 유지된 시간을 측정
-    candidate_start_time = time.monotonic()
-    last_candidate = "unknown"
 
     # 테스트용 모드/명령 상태
     mode = "AUTO"
@@ -241,35 +220,29 @@ def main():
                 # 'l' 토글이 켜진 경우에만 랜드마크를 그린다.
                 if show_landmarks:
                     draw_hand_landmarks(display_frame, hand_landmarks)
-                raw_gesture = detect_raw_gesture(hand_landmarks)
+                landmark_array = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks], dtype=np.float32)
+                sequence_buffer.append(landmark_array)
+                if len(sequence_buffer) == SEQUENCE_LENGTH:
+                    input_tensor = np.array(sequence_buffer, dtype=np.float32)
+                    input_tensor = input_tensor.reshape(1, SEQUENCE_LENGTH, 63)
+                    prediction = model.predict(input_tensor, verbose=0)
+                    raw_gesture = decode_prediction(prediction)
+                else:
+                    raw_gesture = "unknown"
 
                 # 손목(landmark 0) x 좌표를 최근 20프레임 버퍼에 누적한다.
                 wrist_x_history.append(hand_landmarks[0].x)
             else:
+                sequence_buffer.clear()
                 raw_gesture = "unknown"
                 wrist_x_history.clear()
                 swipe_gesture = "unknown"
                 wrist_delta_x = 0.0
 
-            # 프레임 버퍼(최근 10개) 업데이트 (palm/fist 안정화용)
-            gesture_history.append(raw_gesture)
-            if len(gesture_history) > 10:
-                gesture_history.pop(0)
-
-            # 1) 프레임 일관성 조건 판단
-            stable_candidate, dominant_count = get_stable_gesture(gesture_history)
-
-            # 2) 유지 시간 조건 판단(같은 candidate가 0.5초 이상)
+            prediction_history.append(raw_gesture)
+            stable_gesture, smoothing_count = get_smoothed_gesture(prediction_history)
+            hold_seconds = 0.0
             now = time.monotonic()
-            if stable_candidate != last_candidate:
-                last_candidate = stable_candidate
-                candidate_start_time = now
-            hold_seconds = now - candidate_start_time
-
-            if stable_candidate != "unknown" and hold_seconds >= 0.5:
-                stable_gesture = stable_candidate
-            else:
-                stable_gesture = "unknown"
 
             # 손목 x 이동량 기반 swipe 판단 + 1초 쿨다운
             swipe_now = detect_swipe_gesture(wrist_x_history)
@@ -321,8 +294,8 @@ def main():
                     display_frame,
                     gesture,
                     stable_gesture,
-                    dominant_count,
-                    gesture_history,
+                    smoothing_count,
+                    list(prediction_history),
                     hold_seconds,
                     swipe_gesture,
                     wrist_delta_x,
