@@ -74,10 +74,11 @@ landmark_enabled = False
 show_overlay = True
 SEQUENCE_LENGTH = 20
 SMOOTHING_LENGTH = 5
-MOTION_WINDOW = 12
-MOTION_THRESHOLD = 0.08
-STOP_MOTION_SUPPRESS_THRESHOLD = 0.04
-SWIPE_COOLDOWN_SEC = 0.7
+ROTATION_WINDOW = 10
+ROTATION_COOLDOWN_SEC = 0.8
+THUMB_DELTA_THRESHOLD = 0.05
+FINGERS_DELTA_THRESHOLD = 0.03
+MAX_WRIST_X_DRIFT = 0.12
 
 
 def ensure_hand_landmarker_model() -> Path:
@@ -118,13 +119,9 @@ def get_smoothed_gesture(prediction_history: deque[str]) -> tuple[str, int]:
     return smoothed_gesture, count_map[smoothed_gesture]
 
 
-def gesture_to_command(
-    stable_gesture: str,
-    swipe_command: CommandType = "NONE",
-    allow_palm_stop: bool = True,
-) -> CommandType:
-    if swipe_command in {"LEFT", "RIGHT"}:
-        return swipe_command
+def gesture_to_command(stable_gesture: str, rotate_command: CommandType = "NONE", allow_palm_stop: bool = True) -> CommandType:
+    if rotate_command in {"LEFT", "RIGHT"}:
+        return rotate_command
     if stable_gesture == "palm" and allow_palm_stop:
         return "STOP"
     if stable_gesture == "fist":
@@ -132,27 +129,40 @@ def gesture_to_command(
     return "NONE"
 
 
-def detect_swipe_command(wrist_x_buffer: deque[float], now: float, last_swipe_time: float) -> tuple[CommandType, float]:
-    if len(wrist_x_buffer) < MOTION_WINDOW:
-        return "NONE", last_swipe_time
-
-    if (now - last_swipe_time) < SWIPE_COOLDOWN_SEC:
-        return "NONE", last_swipe_time
-
-    delta_x = wrist_x_buffer[-1] - wrist_x_buffer[0]
-    if delta_x >= MOTION_THRESHOLD:
-        wrist_x_buffer.clear()
-        return "RIGHT", now
-    if delta_x <= -MOTION_THRESHOLD:
-        wrist_x_buffer.clear()
-        return "LEFT", now
-    return "NONE", last_swipe_time
+def is_tiger_pose(landmarks: np.ndarray) -> bool:
+    tip_pip_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
+    curled_count = sum(1 for tip, pip in tip_pip_pairs if landmarks[tip, 1] > landmarks[pip, 1] + 0.01)
+    return curled_count >= 3
 
 
-def get_motion_span(wrist_x_buffer: deque[float]) -> float:
-    if len(wrist_x_buffer) < 2:
-        return 0.0
-    return max(wrist_x_buffer) - min(wrist_x_buffer)
+def detect_rotation_command(
+    sequence_buffer: deque[np.ndarray], now: float, last_rotation_time: float
+) -> tuple[CommandType, float, float, float]:
+    if len(sequence_buffer) < ROTATION_WINDOW:
+        return "NONE", last_rotation_time, 0.0, 0.0
+
+    if (now - last_rotation_time) < ROTATION_COOLDOWN_SEC:
+        return "NONE", last_rotation_time, 0.0, 0.0
+
+    window_frames = list(sequence_buffer)[-ROTATION_WINDOW:]
+    start = window_frames[0]
+    end = window_frames[-1]
+
+    if not (is_tiger_pose(start) and is_tiger_pose(end)):
+        return "NONE", last_rotation_time, 0.0, 0.0
+
+    wrist_x_drift = abs(end[0, 0] - start[0, 0])
+    if wrist_x_drift > MAX_WRIST_X_DRIFT:
+        return "NONE", last_rotation_time, 0.0, 0.0
+
+    thumb_delta = float(end[4, 1] - start[4, 1])
+    fingers_delta = float(np.mean(end[[8, 12, 16, 20], 1] - start[[8, 12, 16, 20], 1]))
+
+    if thumb_delta <= -THUMB_DELTA_THRESHOLD and fingers_delta >= FINGERS_DELTA_THRESHOLD:
+        return "LEFT", now, thumb_delta, fingers_delta
+    if thumb_delta >= THUMB_DELTA_THRESHOLD and fingers_delta <= -FINGERS_DELTA_THRESHOLD:
+        return "RIGHT", now, thumb_delta, fingers_delta
+    return "NONE", last_rotation_time, thumb_delta, fingers_delta
 
 
 def draw_hand_landmarks(frame, hand_landmarks) -> None:
@@ -213,8 +223,7 @@ def camera_worker_loop() -> None:
     )
     sequence_buffer: deque[np.ndarray] = deque(maxlen=SEQUENCE_LENGTH)
     prediction_history: deque[str] = deque(maxlen=SMOOTHING_LENGTH)
-    wrist_x_buffer: deque[float] = deque(maxlen=MOTION_WINDOW)
-    last_swipe_time = 0.0
+    last_rotation_time = 0.0
 
     with vision.HandLandmarker.create_from_options(options) as detector:
         while camera_worker_running:
@@ -255,25 +264,24 @@ def camera_worker_loop() -> None:
                     draw_hand_landmarks(frame, hand_landmarks)
             else:
                 sequence_buffer.clear()
-                wrist_x_buffer.clear()
                 gesture = "unknown"
 
             prediction_history.append(gesture)
             stable_gesture, _ = get_smoothed_gesture(prediction_history)
             now = time.monotonic()
-            swipe_command: CommandType = "NONE"
-            motion_span = 0.0
+            rotate_command: CommandType = "NONE"
+            thumb_delta = 0.0
+            fingers_delta = 0.0
 
-            # 손을 편 상태(palm)에서만 좌우 흔들기 시계열 인식을 활성화한다.
-            if result.hand_landmarks and stable_gesture == "palm":
-                wrist_x_buffer.append(result.hand_landmarks[0][0].x)
-                motion_span = get_motion_span(wrist_x_buffer)
-                swipe_command, last_swipe_time = detect_swipe_command(wrist_x_buffer, now, last_swipe_time)
-            else:
-                wrist_x_buffer.clear()
+            # 호랑이 발 모양에서 손 회전(엄지/나머지 손가락 반대 방향 y 변화) 인식
+            if result.hand_landmarks:
+                rotate_command, last_rotation_time, thumb_delta, fingers_delta = detect_rotation_command(
+                    sequence_buffer, now, last_rotation_time
+                )
 
-            allow_palm_stop = not (stable_gesture == "palm" and motion_span >= STOP_MOTION_SUPPRESS_THRESHOLD)
-            auto_command = gesture_to_command(stable_gesture, swipe_command, allow_palm_stop)
+            rotating_now = abs(thumb_delta) >= 0.02 or abs(fingers_delta) >= 0.02
+            allow_palm_stop = not (stable_gesture == "palm" and rotating_now)
+            auto_command = gesture_to_command(stable_gesture, rotate_command, allow_palm_stop)
             auto_robot_status = "Stopped" if auto_command == "STOP" else "Moving"
 
             with state_lock:

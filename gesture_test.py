@@ -15,10 +15,11 @@ STATUS_ENDPOINT = "http://localhost:8000/status"
 SEND_INTERVAL_SEC = 0.2
 SEQUENCE_LENGTH = 20
 SMOOTHING_LENGTH = 5
-MOTION_WINDOW = 12
-MOTION_THRESHOLD = 0.08
-STOP_MOTION_SUPPRESS_THRESHOLD = 0.04
-SWIPE_COOLDOWN_SEC = 0.7
+ROTATION_WINDOW = 10
+ROTATION_COOLDOWN_SEC = 0.8
+THUMB_DELTA_THRESHOLD = 0.05
+FINGERS_DELTA_THRESHOLD = 0.03
+MAX_WRIST_X_DRIFT = 0.12
 
 
 def ensure_hand_landmarker_model() -> Path:
@@ -80,32 +81,44 @@ def get_smoothed_gesture(prediction_history: deque[str]) -> tuple[str, int]:
     return smoothed_gesture, count_map[smoothed_gesture]
 
 
-def detect_swipe_command(wrist_x_buffer: deque[float], now: float, last_swipe_time: float) -> tuple[str, float]:
-    if len(wrist_x_buffer) < MOTION_WINDOW:
-        return "NONE", last_swipe_time
-    if (now - last_swipe_time) < SWIPE_COOLDOWN_SEC:
-        return "NONE", last_swipe_time
-
-    delta_x = wrist_x_buffer[-1] - wrist_x_buffer[0]
-    if delta_x >= MOTION_THRESHOLD:
-        wrist_x_buffer.clear()
-        return "RIGHT", now
-    if delta_x <= -MOTION_THRESHOLD:
-        wrist_x_buffer.clear()
-        return "LEFT", now
-    return "NONE", last_swipe_time
+def is_tiger_pose(landmarks: np.ndarray) -> bool:
+    tip_pip_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
+    curled_count = sum(1 for tip, pip in tip_pip_pairs if landmarks[tip, 1] > landmarks[pip, 1] + 0.01)
+    return curled_count >= 3
 
 
-def get_motion_span(wrist_x_buffer: deque[float]) -> float:
-    if len(wrist_x_buffer) < 2:
-        return 0.0
-    return max(wrist_x_buffer) - min(wrist_x_buffer)
+def detect_rotation_command(
+    sequence_buffer: deque[np.ndarray], now: float, last_rotation_time: float
+) -> tuple[str, float, float, float]:
+    if len(sequence_buffer) < ROTATION_WINDOW:
+        return "NONE", last_rotation_time, 0.0, 0.0
+    if (now - last_rotation_time) < ROTATION_COOLDOWN_SEC:
+        return "NONE", last_rotation_time, 0.0, 0.0
+
+    window_frames = list(sequence_buffer)[-ROTATION_WINDOW:]
+    start = window_frames[0]
+    end = window_frames[-1]
+
+    if not (is_tiger_pose(start) and is_tiger_pose(end)):
+        return "NONE", last_rotation_time, 0.0, 0.0
+
+    wrist_x_drift = abs(end[0, 0] - start[0, 0])
+    if wrist_x_drift > MAX_WRIST_X_DRIFT:
+        return "NONE", last_rotation_time, 0.0, 0.0
+
+    thumb_delta = float(end[4, 1] - start[4, 1])
+    fingers_delta = float(np.mean(end[[8, 12, 16, 20], 1] - start[[8, 12, 16, 20], 1]))
+    if thumb_delta <= -THUMB_DELTA_THRESHOLD and fingers_delta >= FINGERS_DELTA_THRESHOLD:
+        return "LEFT", now, thumb_delta, fingers_delta
+    if thumb_delta >= THUMB_DELTA_THRESHOLD and fingers_delta <= -FINGERS_DELTA_THRESHOLD:
+        return "RIGHT", now, thumb_delta, fingers_delta
+    return "NONE", last_rotation_time, thumb_delta, fingers_delta
 
 
-def gesture_to_command(stable_gesture: str, swipe_command: str = "NONE", allow_palm_stop: bool = True) -> str:
+def gesture_to_command(stable_gesture: str, rotate_command: str = "NONE", allow_palm_stop: bool = True) -> str:
     """안정 제스처를 제어 명령으로 변환한다."""
-    if swipe_command in ("LEFT", "RIGHT"):
-        return swipe_command
+    if rotate_command in ("LEFT", "RIGHT"):
+        return rotate_command
     if stable_gesture == "palm" and allow_palm_stop:
         return "STOP"
     if stable_gesture == "fist":
@@ -138,14 +151,14 @@ def draw_debug_ui(
     smoothing_count: int,
     prediction_history: list[str],
     hold_seconds: float,
-    swipe_command: str,
+    rotate_command: str,
 ):
     """디버그 ON일 때만 보이는 작은 상태 텍스트."""
     y = 160
     debug_lines = [
         f"Gesture: {gesture}",
         f"Stable Gesture: {stable_gesture}",
-        f"Swipe Command: {swipe_command}",
+        f"Rotate Command: {rotate_command}",
         f"Frame Count: {smoothing_count}/5",
         f"History Size: {len(prediction_history)}",
         f"Hold: {hold_seconds:.2f}s",
@@ -191,8 +204,7 @@ def main():
     smoothing_count = 0
     sequence_buffer = deque(maxlen=SEQUENCE_LENGTH)
     prediction_history = deque(maxlen=SMOOTHING_LENGTH)
-    wrist_x_buffer = deque(maxlen=MOTION_WINDOW)
-    last_swipe_time = 0.0
+    last_rotation_time = 0.0
 
     # 테스트용 모드/명령 상태
     mode = "AUTO"
@@ -229,26 +241,24 @@ def main():
                 gesture = detect_temporal_gesture(sequence_buffer)
             else:
                 sequence_buffer.clear()
-                wrist_x_buffer.clear()
                 gesture = "unknown"
 
             prediction_history.append(gesture)
             stable_gesture, smoothing_count = get_smoothed_gesture(prediction_history)
             hold_seconds = 0.0
             now = time.monotonic()
-            swipe_command = "NONE"
-            motion_span = 0.0
-
-            if result.hand_landmarks and stable_gesture == "palm":
-                wrist_x_buffer.append(result.hand_landmarks[0][0].x)
-                motion_span = get_motion_span(wrist_x_buffer)
-                swipe_command, last_swipe_time = detect_swipe_command(wrist_x_buffer, now, last_swipe_time)
-            else:
-                wrist_x_buffer.clear()
+            rotate_command = "NONE"
+            thumb_delta = 0.0
+            fingers_delta = 0.0
+            if result.hand_landmarks:
+                rotate_command, last_rotation_time, thumb_delta, fingers_delta = detect_rotation_command(
+                    sequence_buffer, now, last_rotation_time
+                )
 
             # 안정 제스처를 명령으로 매핑
-            allow_palm_stop = not (stable_gesture == "palm" and motion_span >= STOP_MOTION_SUPPRESS_THRESHOLD)
-            command = gesture_to_command(stable_gesture, swipe_command, allow_palm_stop)
+            rotating_now = abs(thumb_delta) >= 0.02 or abs(fingers_delta) >= 0.02
+            allow_palm_stop = not (stable_gesture == "palm" and rotating_now)
+            command = gesture_to_command(stable_gesture, rotate_command, allow_palm_stop)
             if command == "STOP":
                 mode = "OVERRIDE"
                 robot_status = "Stopped"
@@ -270,7 +280,7 @@ def main():
                     smoothing_count,
                     list(prediction_history),
                     hold_seconds,
-                    swipe_command,
+                    rotate_command,
                 )
 
             # 상태가 바뀌면 백엔드 전송 대기열(pending)에 등록한다.
