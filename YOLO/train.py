@@ -17,7 +17,7 @@ if __name__ == '__main__':
     # 2. 학습 시작
     model.train(
     data=str(data_yaml),
-    epochs=50, 
+    epochs=40, 
     imgsz=416,           # 속도와 정확도의 타협점
     device=device,
     batch=8,             # 16은 MX450에서 튕길 확률이 높으니 8로 하세요
