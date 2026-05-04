@@ -18,6 +18,7 @@ LBL_DIR.mkdir(parents=True, exist_ok=True)
 CLASS_MAP = {0: "fist", 1: "palm"}
 CLASS_DISPLAY_MAP = {0: "FIST(주먹)", 1: "PALM(보자기)"}
 CLASS_COLOR_MAP = {0: (0, 255, 255), 1: (255, 100, 0)}
+PADDING_RATIO_MAP = {0: 0.18, 1: 0.10}
 LEGACY_PREFIX_MAP = {"muk": "fist", "bba": "palm", "plam": "palm"}
 current_class_id = 0
 if len(sys.argv) > 1 and sys.argv[1].isdigit():
@@ -167,7 +168,7 @@ while cap.isOpened():
             # 중심은 유지하고, 폭/높이 기준 padding을 양쪽으로 확장한다.
             bw_raw = x_max - x_min
             bh_raw = y_max - y_min
-            padding_ratio = 0.10
+            padding_ratio = PADDING_RATIO_MAP.get(current_class_id, 0.10)
             x_min -= bw_raw * padding_ratio
             x_max += bw_raw * padding_ratio
             y_min -= bh_raw * padding_ratio
