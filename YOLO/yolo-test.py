@@ -1,7 +1,11 @@
 from ultralytics import YOLO
 import cv2
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from camera_util import open_webcam
 
 # 1. 모델 로드
 yolo_dir = Path(__file__).resolve().parent
@@ -22,7 +26,7 @@ else:
 print(f"사용 모델: {best_pt}")
 model = YOLO(str(best_pt))
 
-cap = cv2.VideoCapture(0)
+cap = open_webcam()
 
 # 마지막 판단 시간을 저장할 변수
 last_inference_time = 0

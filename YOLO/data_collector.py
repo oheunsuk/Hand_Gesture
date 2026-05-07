@@ -5,6 +5,10 @@ import traceback
 from pathlib import Path
 from importlib.metadata import version as pkg_version
 
+HAND_GESTURE_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HAND_GESTURE_ROOT))
+from camera_util import open_webcam
+
 # 1. 경로 설정 (현재 파일 기준)
 YOLO_DIR = Path(__file__).resolve().parent
 BASE_PATH = YOLO_DIR / "datasets" / "train"
@@ -134,7 +138,7 @@ except Exception as e:
     print(traceback.format_exc())
     print("[경고] 폴백 모드로 동작합니다. 화면 중앙 박스 기준으로 라벨 저장합니다.")
 
-cap = cv2.VideoCapture(0)
+cap = open_webcam()
 migrate_legacy_dataset_names()
 
 print(f"=== [{current_class_name.upper()}] 수집 및 테스트 모드 ===")

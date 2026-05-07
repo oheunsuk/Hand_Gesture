@@ -6,6 +6,8 @@ from pathlib import Path
 
 import cv2
 import mediapipe as mp
+
+from camera_util import open_webcam
 from mediapipe.python.solutions.hands_connections import HAND_CONNECTIONS
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
@@ -182,9 +184,10 @@ def main():
         }
     current_class = CLASSES[0]
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("웹캠을 열 수 없습니다. 카메라 연결 상태를 확인하세요.")
+    try:
+        cap = open_webcam()
+    except RuntimeError as e:
+        print(e)
         return
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)

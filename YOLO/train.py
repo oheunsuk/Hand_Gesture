@@ -1,29 +1,171 @@
-from ultralytics import YOLO
-import torch
+from __future__ import annotations
+
+import argparse
+import json
 from pathlib import Path
+import random
+import time
+from typing import Any
 
-if __name__ == '__main__':
+import torch
+from ultralytics import YOLO
+
+from prepare_dataset import prepare_dataset
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - numpy가 없는 환경 대응
+    np = None
+
+
+def parse_args() -> argparse.Namespace:
     yolo_dir = Path(__file__).resolve().parent
-    data_yaml = yolo_dir / "data.yaml"
-    runs_dir = yolo_dir / "runs"
+    parser = argparse.ArgumentParser(description="YOLO 학습 파이프라인 (검증/분할/평가/결과저장)")
+    parser.add_argument("--data", type=str, default=str(yolo_dir / "data.yaml"))
+    parser.add_argument("--model", type=str, default="yolov8n.pt")
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--imgsz", type=int, default=416)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--project", type=str, default=str(yolo_dir / "runs"))
+    parser.add_argument("--name", type=str, default="serbot_test")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--min-samples-per-class", type=int, default=2)
+    parser.add_argument("--device", type=str, default="0")
+    parser.add_argument("--allow-cpu", action="store_true")
+    return parser.parse_args()
 
-    # GPU 강제 사용: CUDA가 없으면 즉시 종료
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if np is not None:
+        np.random.seed(seed)
+
+
+def resolve_device(device_arg: str, allow_cpu: bool) -> int | str:
+    if device_arg.lower() == "cpu":
+        if not allow_cpu:
+            raise RuntimeError("CPU 학습은 비활성화되어 있습니다. --allow-cpu 옵션을 추가하세요.")
+        return "cpu"
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA를 찾지 못했습니다. GPU 드라이버/환경을 확인하세요.")
-    device = 0
-    print(f"사용 장치: cuda:{device}")
+        if allow_cpu:
+            return "cpu"
+        raise RuntimeError("CUDA를 찾지 못했습니다. GPU 드라이버/환경을 확인하거나 --allow-cpu를 사용하세요.")
+    return int(device_arg)
 
-    # 1. 모델 로드 (가장 가벼운 Nano 모델)
-    model = YOLO('yolov8n.pt') 
 
-    # 2. 학습 시작
-    model.train(
-    data=str(data_yaml),
-    epochs=40, 
-    imgsz=416,           # 속도와 정확도의 타협점
-    device=device,
-    batch=8,             # 16은 MX450에서 튕길 확률이 높으니 8로 하세요
-    amp=True,            # 메모리 절약
-    project=str(runs_dir),
-    name='serbot_test'
-)
+def extract_val_metrics(metrics) -> dict[str, float]:
+    box_metrics = metrics.box.mean_results()
+    precision = float(box_metrics[0]) if len(box_metrics) > 0 else 0.0
+    recall = float(box_metrics[1]) if len(box_metrics) > 1 else 0.0
+    map50 = float(box_metrics[2]) if len(box_metrics) > 2 else 0.0
+    map50_95 = float(box_metrics[3]) if len(box_metrics) > 3 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "map50": map50,
+        "map50_95": map50_95,
+    }
+
+
+def print_val_metrics(metric_dict: dict[str, float]) -> None:
+    print("\n=== Validation Metrics (val split) ===")
+    print(f"Precision(정밀도): {metric_dict['precision']:.4f}")
+    print(f"Recall(재현율):    {metric_dict['recall']:.4f}")
+    print(f"F1 Score(F1 점수): {metric_dict['f1']:.4f}")
+    print(f"mAP50(정확도 대체 지표): {metric_dict['map50']:.4f}")
+    print(f"mAP50-95: {metric_dict['map50_95']:.4f}")
+
+
+def ensure_output_dir(train_result, project_dir: Path, run_name: str) -> Path:
+    save_dir = getattr(train_result, "save_dir", None)
+    if save_dir is None:
+        return project_dir / run_name
+    return Path(save_dir)
+
+
+def write_metrics_summary(
+    save_dir: Path,
+    args: argparse.Namespace,
+    split_summary: dict[str, Any],
+    val_metric_dict: dict[str, float],
+    elapsed_seconds: float,
+) -> Path:
+    save_dir.mkdir(parents=True, exist_ok=True)
+    output_path = save_dir / "metrics_summary.json"
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "args": vars(args),
+        "split_summary": split_summary,
+        "val_metrics": val_metric_dict,
+    }
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output_path
+
+
+def main() -> int:
+    args = parse_args()
+    set_global_seed(args.seed)
+    yolo_dir = Path(__file__).resolve().parent
+    data_yaml = Path(args.data).resolve()
+    project_dir = Path(args.project).resolve()
+    device = resolve_device(args.device, allow_cpu=args.allow_cpu)
+
+    print(f"[INFO] 사용 장치: {device}")
+    print("[INFO] train/val 8:2 분할 준비 시작")
+
+    split_result = prepare_dataset(
+        yolo_dir=yolo_dir,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        min_samples_per_class=args.min_samples_per_class,
+        verbose=True,
+    )
+
+    if not data_yaml.exists():
+        raise FileNotFoundError(f"data.yaml이 없습니다: {data_yaml}")
+
+    start_time = time.time()
+    model = YOLO(args.model)
+    train_result = model.train(
+        data=str(data_yaml),
+        epochs=args.epochs,
+        imgsz=args.imgsz,
+        device=device,
+        batch=args.batch,
+        amp=True,
+        project=str(project_dir),
+        name=args.name,
+        patience=args.patience,
+        seed=args.seed,
+    )
+
+    val_metrics = model.val(data=str(data_yaml), split="val", device=device)
+    val_metric_dict = extract_val_metrics(val_metrics)
+    print_val_metrics(val_metric_dict)
+
+    save_dir = ensure_output_dir(train_result, project_dir=project_dir, run_name=args.name)
+    output_path = write_metrics_summary(
+        save_dir=save_dir,
+        args=args,
+        split_summary=split_result.to_dict(),
+        val_metric_dict=val_metric_dict,
+        elapsed_seconds=time.time() - start_time,
+    )
+    print(f"[INFO] metrics_summary 저장 완료: {output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (RuntimeError, FileNotFoundError, ValueError) as exc:
+        print(f"[ERROR] {exc}")
+        raise SystemExit(1)

@@ -9,6 +9,8 @@ os.environ.setdefault("GLOG_minloglevel", "2")
 
 import cv2
 import mediapipe as mp
+
+from camera_util import open_webcam
 import numpy as np
 import requests
 from mediapipe.python.solutions.hands_connections import HAND_CONNECTIONS
@@ -224,12 +226,10 @@ def post_status_to_server(payload: dict) -> bool:
 
 def open_camera_capture() -> cv2.VideoCapture:
     while True:
-        for idx in (0, 1, 2):
-            cap = cv2.VideoCapture(idx)
-            if cap.isOpened():
-                return cap
-            cap.release()
-        time.sleep(0.3)
+        try:
+            return open_webcam()
+        except RuntimeError:
+            time.sleep(0.3)
 
 
 def main():
