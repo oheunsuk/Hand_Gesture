@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hand Gesture Robot Control</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="header card">
+        <div>
+          <p class="eyebrow">Academic Demo</p>
+          <h1>손 제스처 기반 로봇 제어</h1>
+          <p class="subtext">0.5초 주기로 상태를 자동 동기화합니다.</p>
+        </div>
+        <div id="connection-status" class="connection online">Server Connected</div>
+      </header>
+
+      <section class="status-grid">
+        <article id="mode-card" class="card status-card">
+          <h2>Mode</h2>
+          <p id="mode-value" class="value">AUTO</p>
+        </article>
+
+        <article id="source-card" class="card status-card gesture">
+          <h2>Control Source</h2>
+          <p id="source-value" class="value">Gesture</p>
+        </article>
+
+        <article class="card status-card">
+          <h2>Gesture</h2>
+          <p id="gesture-value" class="value">unknown</p>
+        </article>
+
+        <article class="card status-card">
+          <h2>Stable Gesture</h2>
+          <p id="stable-gesture-value" class="value">unknown</p>
+        </article>
+
+        <article id="command-card" class="card status-card command-card">
+          <h2>Command</h2>
+          <p id="command-value" class="value">NONE</p>
+        </article>
+
+        <article class="card status-card">
+          <h2>Robot Status</h2>
+          <p id="robot-status-value" class="value">Moving</p>
+        </article>
+
+        <article class="card status-card swipe-series-card">
+          <h2>L/R 시계열</h2>
+          <p id="swipe-series-value" class="value swipe-mono">-</p>
+          <p id="swipe-delta-value" class="value swipe-mono swipe-delta">-</p>
+        </article>
+      </section>
+
+      <section class="card camera-panel">
+        <div class="camera-panel-head">
+          <h2>Camera View</h2>
+          <button id="landmark-toggle-btn" class="landmark-toggle off" type="button">Landmark OFF</button>
+        </div>
+        <div class="camera-grid">
+          <article class="camera-card">
+            <h3>노트북 카메라</h3>
+            <img id="laptop-camera" alt="노트북 카메라 스트림" />
+          </article>
+          <article class="camera-card">
+            <h3>로봇 카메라</h3>
+            <div class="robot-camera-placeholder">
+              <video id="robot-camera" autoplay playsinline muted></video>
+              <p>Robot Camera (Not Connected)</p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="card control-panel">
+        <h2>Fallback Control</h2>
+        <div class="button-grid">
+          <button class="control-button stop" data-command="STOP">STOP</button>
+          <button class="control-button resume" data-command="RESUME">RESUME</button>
+          <button class="control-button side" data-command="LEFT">LEFT</button>
+          <button class="control-button side" data-command="RIGHT">RIGHT</button>
+        </div>
+        <p id="message" class="message" aria-live="polite"></p>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
+
