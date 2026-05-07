@@ -3,6 +3,7 @@
 path: D:/hand/Hand_Gesture/YOLO/datasets
 train: train/images
 val: val/images
+test: test/images
 
 nc: 2
 names: ['fist', 'palm']
