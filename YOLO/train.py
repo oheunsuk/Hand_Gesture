@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 from pathlib import Path
 import random
@@ -10,7 +11,7 @@ from typing import Any
 import torch
 from ultralytics import YOLO
 
-from prepare_dataset import prepare_dataset, read_data_yaml
+from prepare_dataset import collect_samples, read_data_yaml
 
 try:
     import numpy as np
@@ -20,7 +21,7 @@ except ImportError:  # pragma: no cover - numpy가 없는 환경 대응
 
 def parse_args() -> argparse.Namespace:
     yolo_dir = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description="YOLO 학습 파이프라인 (train/val/test 분할 + test 평가)")
+    parser = argparse.ArgumentParser(description="YOLO 학습 파이프라인 (고정 train/val/test 사용 + test 평가)")
     parser.add_argument("--data", type=str, default=str(yolo_dir / "data.yaml"))
     parser.add_argument("--model", type=str, default="yolov8n.pt")
     parser.add_argument("--epochs", type=int, default=40)
@@ -30,9 +31,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--name", type=str, default="serbot_test")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--val-ratio", type=float, default=0.2)
-    parser.add_argument("--test-ratio", type=float, default=0.2)
-    parser.add_argument("--min-samples-per-class", type=int, default=2)
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--allow-cpu", action="store_true")
     return parser.parse_args()
@@ -91,6 +89,66 @@ def ensure_output_dir(train_result, project_dir: Path, run_name: str) -> Path:
     return Path(save_dir)
 
 
+def summarize_fixed_splits(data_yaml: Path, data_yaml_values: dict[str, str]) -> dict[str, Any]:
+    dataset_root = (data_yaml.parent / data_yaml_values.get("path", "")).resolve()
+    split_samples: dict[str, dict[str, Any]] = {}
+
+    for split_name in ("train", "val", "test"):
+        images_rel = data_yaml_values.get(split_name)
+        if not images_rel:
+            raise ValueError(f"data.yaml에 {split_name} 경로가 없습니다. 예: {split_name}: {split_name}/images")
+
+        images_dir = (dataset_root / images_rel).resolve()
+        labels_dir = images_dir.parent / "labels"
+        if not images_dir.exists() or not labels_dir.exists():
+            raise FileNotFoundError(
+                f"{split_name} 경로가 올바르지 않습니다. images={images_dir}, labels={labels_dir}"
+            )
+
+        sample_map = collect_samples(images_dir=images_dir, labels_dir=labels_dir)
+        split_samples[split_name] = {
+            "samples": list(sample_map.values()),
+            "images_dir": str(images_dir),
+        }
+
+    train_stems = {sample.stem for sample in split_samples["train"]["samples"]}
+    val_stems = {sample.stem for sample in split_samples["val"]["samples"]}
+    test_stems = {sample.stem for sample in split_samples["test"]["samples"]}
+    overlap_count = len(train_stems & val_stems) + len(train_stems & test_stems) + len(val_stems & test_stems)
+    if overlap_count > 0:
+        raise RuntimeError("고정 split에서 파일명이 중복되었습니다. train/val/test 구성을 확인하세요.")
+
+    class_distribution: dict[str, dict[str, int]] = {}
+    class_names = {
+        sample.class_name for split_name in ("train", "val", "test") for sample in split_samples[split_name]["samples"]
+    }
+    for class_name in sorted(class_names):
+        class_distribution[class_name] = {}
+        for split_name in ("train", "val", "test"):
+            class_counter = Counter(sample.class_name for sample in split_samples[split_name]["samples"])
+            class_distribution[class_name][split_name] = class_counter.get(class_name, 0)
+
+    train_count = len(split_samples["train"]["samples"])
+    val_count = len(split_samples["val"]["samples"])
+    test_count = len(split_samples["test"]["samples"])
+    total_samples = train_count + val_count + test_count
+    if total_samples == 0:
+        raise FileNotFoundError("학습할 샘플이 없습니다. datasets/train|val|test 데이터를 확인하세요.")
+
+    return {
+        "total_samples": total_samples,
+        "train_samples": train_count,
+        "val_samples": val_count,
+        "test_samples": test_count,
+        "class_distribution": class_distribution,
+        "overlap_count": overlap_count,
+        "dataset_root": str(dataset_root),
+        "train_images": split_samples["train"]["images_dir"],
+        "val_images": split_samples["val"]["images_dir"],
+        "test_images": split_samples["test"]["images_dir"],
+    }
+
+
 def write_metrics_summary(
     save_dir: Path,
     args: argparse.Namespace,
@@ -122,22 +180,20 @@ def main() -> int:
     device = resolve_device(args.device, allow_cpu=args.allow_cpu)
 
     print(f"[INFO] 사용 장치: {device}")
-    print(f"[INFO] train/val/test 분할 준비 시작 (val={args.val_ratio}, test={args.test_ratio})")
-
-    split_result = prepare_dataset(
-        yolo_dir=yolo_dir,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        seed=args.seed,
-        min_samples_per_class=args.min_samples_per_class,
-        verbose=True,
-    )
+    print("[INFO] 고정 split(train/val/test) 검증 시작")
 
     if not data_yaml.exists():
         raise FileNotFoundError(f"data.yaml이 없습니다: {data_yaml}")
     data_yaml_values = read_data_yaml(data_yaml)
-    if not data_yaml_values.get("test"):
-        raise ValueError("data.yaml에 test 경로가 없습니다. 예: test: test/images")
+    split_summary = summarize_fixed_splits(data_yaml, data_yaml_values)
+    print(
+        f"[DATA] total={split_summary['total_samples']}, train={split_summary['train_samples']}, "
+        f"val={split_summary['val_samples']}, test={split_summary['test_samples']}"
+    )
+    print(f"[CHECK] overlap={split_summary['overlap_count']}")
+    print(f"[CHECK] train path={split_summary['train_images']}")
+    print(f"[CHECK] val path={split_summary['val_images']}")
+    print(f"[CHECK] test path={split_summary['test_images']}")
 
     start_time = time.time()
     model = YOLO(args.model)
@@ -166,7 +222,7 @@ def main() -> int:
     output_path = write_metrics_summary(
         save_dir=save_dir,
         args=args,
-        split_summary=split_result.to_dict(),
+        split_summary=split_summary,
         val_metric_dict=val_metric_dict,
         test_metric_dict=test_metric_dict,
         elapsed_seconds=time.time() - start_time,
