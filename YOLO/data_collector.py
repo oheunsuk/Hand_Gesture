@@ -55,14 +55,21 @@ def _extract_sequential_index(file_stem: str, expected_prefix: str) -> int | Non
     return int(index_part)
 
 
+def _get_split_class_prefix(class_name: str) -> str:
+    if BASE_PATH is None:
+        raise RuntimeError("BASE_PATH가 초기화되지 않았습니다.")
+    return f"{BASE_PATH.name}_{class_name}"
+
+
 def get_next_index_for_class(class_name: str) -> int:
     if LBL_DIR is None:
         raise RuntimeError("LBL_DIR가 초기화되지 않았습니다.")
 
     used_indices = set()
+    expected_prefix = _get_split_class_prefix(class_name)
 
-    for label_file in LBL_DIR.glob(f"{class_name}_*.txt"):
-        index = _extract_sequential_index(label_file.stem, class_name)
+    for label_file in LBL_DIR.glob(f"{expected_prefix}_*.txt"):
+        index = _extract_sequential_index(label_file.stem, expected_prefix)
         if index is not None:
             used_indices.add(index)
 
@@ -96,7 +103,8 @@ def migrate_legacy_dataset_names() -> None:
         old_prefix = old_stem.split("_", 1)[0]
         target_prefix = LEGACY_PREFIX_MAP[old_prefix]
         next_index = get_next_index_for_class(target_prefix)
-        new_stem = f"{target_prefix}_{next_index}"
+        split_class_prefix = _get_split_class_prefix(target_prefix)
+        new_stem = f"{split_class_prefix}_{next_index}"
 
         new_label_path = LBL_DIR / f"{new_stem}.txt"
         label_file.rename(new_label_path)
@@ -317,7 +325,8 @@ def run_collector(dataset_split: str = "train", class_id: int = 0) -> None:
                 print(f"[CLASS] 현재 클래스: {CLASS_DISPLAY_MAP[current_class_id]}")
             elif key == ord("s") and yolo_label != "":
                 next_index = get_next_index_for_class(current_class_name)
-                file_name = f"{current_class_name}_{next_index}"
+                split_class_prefix = _get_split_class_prefix(current_class_name)
+                file_name = f"{split_class_prefix}_{next_index}"
 
                 if IMG_DIR is None or LBL_DIR is None:
                     raise RuntimeError("dataset 저장 경로가 초기화되지 않았습니다.")
