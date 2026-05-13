@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import Counter
 import json
 from pathlib import Path
@@ -24,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="YOLO 학습 파이프라인 (고정 train/val/test 사용 + test 평가)")
     parser.add_argument("--data", type=str, default=str(yolo_dir / "data.yaml"))
     parser.add_argument("--model", type=str, default="yolov8n.pt")
-    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--imgsz", type=int, default=416)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--project", type=str, default=str(yolo_dir / "runs"))
@@ -171,6 +172,84 @@ def write_metrics_summary(
     return output_path
 
 
+def save_compact_training_figure(save_dir: Path) -> Path | None:
+    results_csv = save_dir / "results.csv"
+    if not results_csv.exists():
+        print(f"[WARN] results.csv를 찾지 못했습니다: {results_csv}")
+        return None
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[WARN] matplotlib이 없어 custom 4패널 그래프 생성을 건너뜁니다.")
+        return None
+
+    epochs: list[int] = []
+    train_box_loss: list[float] = []
+    val_box_loss: list[float] = []
+    map50_values: list[float] = []
+    precision_values: list[float] = []
+    recall_values: list[float] = []
+
+    with results_csv.open("r", encoding="utf-8", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        for row in reader:
+            epoch_raw = row.get("epoch")
+            train_loss_raw = row.get("train/box_loss")
+            val_loss_raw = row.get("val/box_loss")
+            map50_raw = row.get("metrics/mAP50(B)")
+            precision_raw = row.get("metrics/precision(B)")
+            recall_raw = row.get("metrics/recall(B)")
+
+            if not all([epoch_raw, train_loss_raw, val_loss_raw, map50_raw, precision_raw, recall_raw]):
+                continue
+
+            try:
+                epochs.append(int(float(epoch_raw)))
+                train_box_loss.append(float(train_loss_raw))
+                val_box_loss.append(float(val_loss_raw))
+                map50_values.append(float(map50_raw))
+                precision_values.append(float(precision_raw))
+                recall_values.append(float(recall_raw))
+            except ValueError:
+                continue
+
+    if not epochs:
+        print(f"[WARN] results.csv에서 그래프용 데이터를 읽지 못했습니다: {results_csv}")
+        return None
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    ax_loss, ax_map50, ax_precision, ax_recall = axes.ravel()
+
+    ax_loss.plot(epochs, train_box_loss, label="train/box_loss")
+    ax_loss.plot(epochs, val_box_loss, label="val/box_loss")
+    ax_loss.set_title("Loss")
+    ax_loss.set_xlabel("Epoch")
+    ax_loss.grid(True, alpha=0.3)
+    ax_loss.legend()
+
+    ax_map50.plot(epochs, map50_values, color="tab:green")
+    ax_map50.set_title("mAP50")
+    ax_map50.set_xlabel("Epoch")
+    ax_map50.grid(True, alpha=0.3)
+
+    ax_precision.plot(epochs, precision_values, color="tab:orange")
+    ax_precision.set_title("Precision")
+    ax_precision.set_xlabel("Epoch")
+    ax_precision.grid(True, alpha=0.3)
+
+    ax_recall.plot(epochs, recall_values, color="tab:red")
+    ax_recall.set_title("Recall")
+    ax_recall.set_xlabel("Epoch")
+    ax_recall.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    output_path = save_dir / "custom_metrics_4panel.png"
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
 def main() -> int:
     args = parse_args()
     set_global_seed(args.seed)
@@ -228,6 +307,9 @@ def main() -> int:
         elapsed_seconds=time.time() - start_time,
     )
     print(f"[INFO] metrics_summary 저장 완료: {output_path}")
+    plot_path = save_compact_training_figure(save_dir)
+    if plot_path is not None:
+        print(f"[INFO] 4패널 그래프 저장 완료: {plot_path}")
     return 0
 
 
